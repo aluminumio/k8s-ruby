@@ -3,7 +3,8 @@
 RSpec.describe K8s::ResourceClient do
   include FixtureHelpers
 
-  let(:transport) { K8s::Transport.new('http://localhost:8080') }
+  let(:transport_options) { {} }
+  let(:transport) { K8s::Transport.new('http://localhost:8080', **transport_options) }
 
   context "for the nodes API" do
     let(:api_client) { K8s::APIClient.new(transport, 'v1') }
@@ -374,13 +375,13 @@ RSpec.describe K8s::ResourceClient do
           subject.watch(timeout: 60)
         end
       end
-      
+
       describe '#exec' do
         let(:ws) { double(Faye::WebSocket::Client, send: nil) }
 
         before do
           allow(Faye::WebSocket::Client).to receive(:new).and_return(ws)
-          allow(Termios).to receive(:tcgetattr).and_return(double(dup: double(lflag: 0, 'lflag=': 0)))
+          allow(Termios).to receive(:tcgetattr).and_return(double(dup: double(lflag: 0, :'lflag=' => 0)))
           allow(Termios).to receive(:tcsetattr).and_return(nil)
           allow(ws).to receive(:on)
         end
@@ -389,9 +390,9 @@ RSpec.describe K8s::ResourceClient do
           before { exec }
 
           context "when client cert and key data are provided" do
-            let(:transport_options) do
+            let(:transport_options) {
               { client_cert_data: 'dummy-client-cert-data', client_key_data: 'dummy-client-key-data' }
-            end
+            }
 
             it 'creates a websocket connection using the client cert and key data' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
@@ -400,16 +401,16 @@ RSpec.describe K8s::ResourceClient do
                 headers: {},
                 tls: hash_including(
                   cert_chain_file: have_file_content('dummy-client-cert-data'),
-                  private_key_file: have_file_content('dummy-client-key-data')
+                  private_key_file: have_file_content('dummy-client-key-data'),
                 )
               )
             end
           end
 
           context "when client cert and key files are provided" do
-            let(:transport_options) do
+            let(:transport_options) {
               { client_cert: '/var/run/dummy-client-cert-file.crt', client_key: '/var/run/dummy-client-key-file.key' }
-            end
+            }
 
             it 'creates a websocket connection using the client cert and key files' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
@@ -418,16 +419,16 @@ RSpec.describe K8s::ResourceClient do
                 headers: {},
                 tls: hash_including(
                   cert_chain_file: transport_options[:client_cert],
-                  private_key_file: transport_options[:client_key]
+                  private_key_file: transport_options[:client_key],
                 )
               )
             end
           end
 
           context "when authorization token is provided" do
-            let(:transport_options) do
+            let(:transport_options) {
               { auth_token: 'dummy-auth-token' }
-            end
+            }
 
             it 'creates a websocket connection using the authorization token' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
@@ -438,7 +439,7 @@ RSpec.describe K8s::ResourceClient do
                 ),
                 tls: hash_including(
                   cert_chain_file: nil,
-                  private_key_file: nil
+                  private_key_file: nil,
                 )
               )
             end
@@ -458,7 +459,7 @@ RSpec.describe K8s::ResourceClient do
 
         describe "stdin" do
           before do
-            allow(EM).to receive(:open_keyboard).and_invoke(->(handler) { EM.attach($stdin, handler) })
+            allow(EM).to receive(:open_keyboard).and_invoke( -> (handler) { EM.attach($stdin, handler) })
           end
 
           after do
@@ -478,7 +479,6 @@ RSpec.describe K8s::ResourceClient do
         end
 
         private
-
         def em
           EM.run do
             yield
