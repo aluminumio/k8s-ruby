@@ -254,6 +254,36 @@ This opens a new shell in the `test-pod` container:
 client.api('v1').resource('pods', namespace: 'default').exec(name: 'test-pod', container: 'shell', command: '/bin/sh')
 ```
 
+### Getting pod logs
+
+You can get logs from a pod's container:
+
+```ruby
+# Get logs as a string
+logs = client.api('v1').resource('pods', namespace: 'default').logs(
+  name: 'test-pod',
+  container: 'app'
+)
+
+# Follow logs with a block
+client.api('v1').resource('pods', namespace: 'default').logs(
+  name: 'test-pod',
+  container: 'app',
+  follow: true
+) do |chunk|
+  puts chunk
+end
+
+# Get logs with additional parameters
+logs = client.api('v1').resource('pods', namespace: 'default').logs(
+  name: 'test-pod',
+  container: 'app',
+  timestamps: true,
+  tail_lines: 10,
+  since_time: '2023-01-01T00:00:00Z'
+)
+```
+
 ## Contributing
 
 Bug reports and pull requests are welcome on GitHub at [k8s-ruby/k8s-ruby](https://github.com/k8s-ruby/k8s-ruby).
