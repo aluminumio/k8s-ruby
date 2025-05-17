@@ -78,8 +78,8 @@ module K8s
               logger.error(event.message)
             end
 
-            term_attributes_original = Termios.tcgetattr($stdin)
             if tty
+              term_attributes_original = Termios.tcgetattr($stdin)
               term_attributes = term_attributes_original.dup
               term_attributes.lflag &= ~Termios::ECHO
               term_attributes.lflag &= ~Termios::ICANON
@@ -94,7 +94,7 @@ module K8s
             end
 
             ws.on :close do
-              Termios.tcsetattr($stdin, Termios::TCSANOW, term_attributes_original)
+              Termios.tcsetattr($stdin, Termios::TCSANOW, term_attributes_original) if tty
               EM.stop
             end
           end
