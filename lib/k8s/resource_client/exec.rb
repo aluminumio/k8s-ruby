@@ -63,7 +63,11 @@ module K8s
             ws = @transport.build_ws_conn(exec_path, query)
 
             ws.on :message do |event|
-              out = event.data.pack("C*")
+              # Previously we were packing the event.data into bytes, i.e.
+              # pack("C*"), but now event.data is already in bytes (type:
+              # String) when we receive it, i.e. "\x01", so we can just pass it
+              # along as it is...
+              out = event.data
 
               if block_given?
                 yield(out)
