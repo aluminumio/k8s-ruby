@@ -63,7 +63,20 @@ module K8s
             ws = @transport.build_ws_conn(exec_path, query)
 
             ws.on :message do |event|
-              out = event.data.pack("C*")
+              # Previously we were packing event.data (which was an array) into
+              # bytes, but now event.data is turning up already in bytes (a
+              # String with ASCII encoding), i.e. "\x01", perhaps some depdency
+              # is now doing something different...
+
+              # So, if the data we receive is already a byte stream...
+              if event.data.is_a?(String) && event.data.encoding == Encoding::ASCII_8BIT
+                #...we can just pass it along _as is_
+                out = event.data
+              else
+                #...otherwise treat it as a array of data that needs to be
+                # converted into bytes
+                out = event.data.pack("C*")
+              end
 
               if block_given?
                 yield(out)
