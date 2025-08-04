@@ -10,6 +10,10 @@ module K8s
   class Transport
     include Logging
 
+    # Default Excon options
+    MAX_RETRIES = 3
+    BACKOFF_FACTOR = 2
+
     quiet! # do not log warnings by default
 
     # Excon middlewares for requests
@@ -300,7 +304,18 @@ module K8s
       # Use a fresh connection for streaming requests to avoid any buffering issues
       excon_client = options[:response_block] ? build_excon : excon
 
-      response = excon_client.request(**excon_options)
+      retries = 0
+      begin
+        response = excon_client.request(**excon_options)
+      rescue  Excon::Error::Socket => e
+        logger.warn { "Retrying request due to Excon::Error:Socket Error: #{e.message}" }
+        if retries < MAX_RETRIES
+          sleep (BACKOFF_FACTOR ** retries)
+          retries += 1
+          retry
+        end
+      end
+
       t = Time.now - start
 
       obj = options[:response_block] ? {} : parse_response(response, options, response_class: response_class)
