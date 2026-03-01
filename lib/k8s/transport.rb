@@ -308,12 +308,14 @@ module K8s
       begin
         response = excon_client.request(**excon_options)
       rescue  Excon::Error::Socket => e
-        logger.warn { "Retrying request due to Excon::Error:Socket Error: #{e.message}" }
         if retries < MAX_RETRIES
-          sleep (BACKOFF_FACTOR ** retries)
           retries += 1
+          logger.warn { "#{format_request(options)} => Excon::Error::Socket: #{e.message} (retry #{retries}/#{MAX_RETRIES})" }
+          sleep (BACKOFF_FACTOR ** retries)
           retry
         end
+        logger.error { "#{format_request(options)} => Excon::Error::Socket: #{e.message} (exhausted #{MAX_RETRIES} retries)" }
+        raise
       end
 
       t = Time.now - start
