@@ -23,7 +23,9 @@ Gem::Specification.new do |spec|
   spec.require_paths = ["lib"]
   spec.required_ruby_version = ">= 2.4"
 
-  spec.add_runtime_dependency "excon", "~> 0.71"
+  # Using fork with SOCKS5 support until upstream PR is merged
+  # PR: https://github.com/excon/excon/pull/XXX
+  spec.add_runtime_dependency "excon", ">= 0.71"
   spec.add_runtime_dependency "dry-struct"
   spec.add_runtime_dependency "dry-types"
   spec.add_runtime_dependency "dry-configurable"
@@ -43,4 +45,5 @@ Gem::Specification.new do |spec|
   spec.add_development_dependency "webmock", "~> 3.6"
   spec.add_development_dependency "rubocop", "~> 0.82"
   spec.add_development_dependency "byebug", "~> 11.1"
+  spec.add_development_dependency "webrick", "~> 1.7"
 end

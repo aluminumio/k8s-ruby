@@ -773,4 +773,60 @@ RSpec.describe K8s::Transport do
       expect(subject.need_delete_body?).to be_truthy
     end
   end
+
+  describe 'SOCKS5 proxy support' do
+    describe '#initialize with socks5_proxy' do
+      subject { described_class.new('http://localhost:8080', socks5_proxy: 'localhost:1080') }
+
+      it 'stores the socks5_proxy in options' do
+        expect(subject.options[:socks5_proxy]).to eq 'localhost:1080'
+      end
+    end
+
+    describe '#initialize with socks5_proxy with auth' do
+      subject { described_class.new('http://localhost:8080', socks5_proxy: 'user:pass@proxy.example.com:1080') }
+
+      it 'stores the socks5_proxy with credentials in options' do
+        expect(subject.options[:socks5_proxy]).to eq 'user:pass@proxy.example.com:1080'
+      end
+    end
+
+    describe '#self.config with socks5_proxy override' do
+      let(:config) { K8s::Config.new(
+        clusters: [
+          {
+            name: 'kubernetes',
+            cluster: {
+              server: 'https://localhost:6443',
+              'insecure-skip-tls-verify' => true,
+            }
+          }
+        ],
+        users: [
+          {
+            name: 'test',
+            user: {
+              token: 'test-token'
+            }
+          }
+        ],
+        contexts: [
+          {
+            name: 'test',
+            context: {
+              cluster: 'kubernetes',
+              user: 'test',
+            }
+          }
+        ],
+        'current-context' => 'test',
+      ) }
+
+      subject { described_class.config(config, socks5_proxy: 'localhost:1080') }
+
+      it 'passes socks5_proxy to the transport' do
+        expect(subject.options[:socks5_proxy]).to eq 'localhost:1080'
+      end
+    end
+  end
 end

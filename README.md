@@ -105,6 +105,32 @@ client = K8s::Client.config(K8s::Config.load_file('~/.kube/config'),
 client = K8s::Client.in_cluster_config
 ```
 
+#### Client with SOCKS5 proxy
+
+Connect to a Kubernetes API through a SOCKS5 proxy:
+
+```ruby
+# Basic SOCKS5 proxy
+client = K8s.client('https://k8s-api.example.com:6443',
+  socks5_proxy: 'localhost:1080',
+  ssl_verify_peer: false
+)
+
+# SOCKS5 proxy with authentication
+client = K8s.client('https://k8s-api.example.com:6443',
+  socks5_proxy: 'user:password@proxy.example.com:1080',
+  ssl_verify_peer: false
+)
+
+# With kubeconfig and SOCKS5 proxy override
+client = K8s::Client.config(
+  K8s::Config.load_file('~/.kube/config'),
+  socks5_proxy: 'localhost:1080'
+)
+```
+
+> **Note:** WebSocket-based features (exec, log streaming with `follow: true`) do not currently support SOCKS5 proxy.
+
 ### Logging
 
 #### Quiet

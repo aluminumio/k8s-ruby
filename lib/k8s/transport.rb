@@ -155,15 +155,18 @@ module K8s
     # @param auth_token [String] optional Authorization: Bearer token
     # @param auth_username [String] optional Basic authentication username
     # @param auth_password [String] optional Basic authentication password
+    # @param socks5_proxy [String] optional SOCKS5 proxy (e.g., "host:port" or "user:pass@host:port")
     # @param options [Hash] @see Excon.new
-    def initialize(server, auth_token: nil, auth_username: nil, auth_password: nil, **options)
+    def initialize(server, auth_token: nil, auth_username: nil, auth_password: nil, socks5_proxy: nil, **options)
       uri = URI.parse(server)
       @server = "#{uri.scheme}://#{uri.host}:#{uri.port}"
       @path_prefix = File.join('/', uri.path, '/') # add leading and/or trailing slashes
       @auth_token = auth_token
       @auth_username = auth_username
       @auth_password = auth_password
+      @socks5_proxy = socks5_proxy
       @options = options
+      @options[:socks5_proxy] = socks5_proxy if socks5_proxy
 
       logger! progname: @server
     end
@@ -400,10 +403,15 @@ module K8s
 
     # Returns a websocket connection using part of the current transport configuration.
     # Will use same host and port returned by #server.
+    # Note: WebSocket connections do not currently support SOCKS5 proxy.
     # @param resource_path [String]
     # @param query [Hash]
     # @return [Faye::WebSocket::Client]
     def build_ws_conn(resource_path, query = {})
+      if @socks5_proxy
+        logger.warn "WebSocket connections (exec, logs follow) do not support SOCKS5 proxy"
+      end
+
       private_key_file = nil
       cert_chain_file = nil
 
