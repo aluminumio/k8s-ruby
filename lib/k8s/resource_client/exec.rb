@@ -33,7 +33,7 @@ module K8s
           @result = result
           detail = result.stderr.strip
           detail = result.stdout.strip if detail.empty?
-          super("#{Array(command).join(' ')} exited #{result.exit_code}: #{detail}")
+          super("#{Exec.program(command)} exited #{result.exit_code}: #{detail}")
         end
       end
 
@@ -87,6 +87,13 @@ module K8s
       rescue JSON::ParserError
         # v1 subprotocol: "command terminated with non-zero exit code: exit status 7"
         status[/exit (?:status|code) (\d+)/, 1]&.to_i || 1
+      end
+
+      # Names the command in an error without repeating its arguments, which
+      # routinely carry credentials (curl -u, psql, redis-cli -a).
+      def self.program(command)
+        argv = [command].flatten
+        argv.length > 1 ? "#{argv.first} (#{argv.length - 1} args)" : argv.first.to_s
       end
 
       # Command output is normally text. Tag it UTF-8 so callers can parse it,
@@ -150,7 +157,7 @@ module K8s
           Exec.schedule do
             ws = @transport.build_ws_conn(exec_path, query, protocols: [Exec::SUBPROTOCOL])
             timer = EM.add_timer(timeout) do
-              failure ||= Exec::Error.new("exec timed out after #{timeout}s: #{[command].flatten.join(' ')}")
+              failure ||= Exec::Error.new("exec timed out after #{timeout}s: #{Exec.program(command)}")
               ws.close
             end
 
@@ -191,7 +198,7 @@ module K8s
           Termios.tcsetattr($stdin, Termios::TCSANOW, original_term) if original_term
 
           raise failure if failure
-          raise Exec::Error, "exec never closed: #{[command].flatten.join(' ')}" if wedged
+          raise Exec::Error, "exec never closed: #{Exec.program(command)}" if wedged
           return if tty || block
 
           Result.new(
