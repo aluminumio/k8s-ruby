@@ -4,9 +4,13 @@ module K8s
   class ResourceClient
     # Executes commands in a container over the API server's exec websocket.
     #
-    # Kubernetes multiplexes the exec streams down one socket: every frame
-    # begins with a channel byte (1 stdout, 2 stderr, 3 status). Frames must be
-    # demultiplexed as they arrive -- once concatenated the boundaries are gone.
+    # Kubernetes multiplexes the exec streams down one socket: byte 0 of every
+    # frame is the channel (1 stdout, 2 stderr, 3 status) and the rest is
+    # payload. Frames must be demultiplexed as they arrive, because concatenating
+    # them whole leaves a channel byte at each boundary -- JSON that parses or
+    # not depending on how the server happened to split the reply -- and once
+    # joined the boundaries are gone, so it cannot be undone afterwards.
+    #
     # Channel 3 carries the exit status, but only the v4 subprotocol makes it
     # machine-readable, so we negotiate v4 and fall back to parsing v1's prose.
     module Exec
