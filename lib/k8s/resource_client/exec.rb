@@ -99,7 +99,10 @@ module K8s
         argv = [command].flatten.compact
         return "command" if argv.empty?
 
-        argv.length > 1 ? "#{argv.first} (#{argv.length - 1} args)" : argv.first.to_s
+        return argv.first.to_s if argv.length == 1
+
+        count = argv.length - 1
+        "#{argv.first} (#{count} #{count == 1 ? 'arg' : 'args'})"
       end
 
       # Command output is normally text. Tag it UTF-8 so callers can parse it,
@@ -137,15 +140,19 @@ module K8s
         def exec(name:, command:, container: nil, namespace: @namespace,
                  stdin: false, stdout: true, stderr: true, tty: false,
                  timeout: Exec::DEFAULT_TIMEOUT, &block)
-          query = {
-            command: [command].flatten,
-            stdin: !!stdin,
-            stdout: !!stdout,
-            stderr: !!stderr,
-            tty: !!tty
-          }
+          query = { command: [command].flatten }
           query[:container] = container if container
+          query.merge!(stdin: !!stdin, stdout: !!stdout, stderr: !!stderr, tty: !!tty)
           exec_path = path(name, namespace: namespace, subresource: "exec")
+
+          # This blocks the calling thread until the command finishes, so from
+          # inside the reactor it would deadlock: the tick that drives the
+          # socket cannot run while its own thread waits here. Fail fast rather
+          # than hang until the timeout.
+          if EM.reactor_running? && EM.reactor_thread == Thread.current
+            raise Exec::Error, "exec blocks until the command finishes, so it cannot be called " \
+                               "from inside the EventMachine reactor thread"
+          end
 
           out = +"".b
           err = +"".b
