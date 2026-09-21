@@ -377,13 +377,53 @@ RSpec.describe K8s::ResourceClient do
       end
 
       describe '#exec' do
-        let(:ws) { double(Faye::WebSocket::Client, send: nil) }
+        # Replays canned frames once exec has registered its handlers. exec
+        # registers :close last, which is the cue that it is ready.
+        class FakeSocket
+          Event = Struct.new(:data, :message)
+
+          attr_reader :sent
+
+          def initialize(frames)
+            @frames = frames
+            @handlers = {}
+            @sent = []
+          end
+
+          def on(event, &block)
+            @handlers[event] = block
+            return unless event == :close
+
+            @frames.each { |f| @handlers[:message].call(Event.new(f, nil)) }
+            @handlers[:close].call(nil)
+          end
+
+          def send(data) = @sent << data
+
+          def close; end
+        end
+
+        let(:success) { frame(3, '{"metadata":{},"status":"Success"}') }
+        let(:socket) { FakeSocket.new(frames) }
+        let(:frames) { [frame(1, "hello\n"), success] }
+
+        def frame(channel, payload) = ([channel].pack("C") + payload).b
 
         before do
-          allow(Faye::WebSocket::Client).to receive(:new).and_return(ws)
+          allow(Faye::WebSocket::Client).to receive(:new).and_return(socket)
           allow(Termios).to receive(:tcgetattr).and_return(double(dup: double(lflag: 0, 'lflag=': 0)))
           allow(Termios).to receive(:tcsetattr).and_return(nil)
-          allow(ws).to receive(:on)
+        end
+
+        def exec(name: 'test-pod', namespace: 'test-namespace', command: '/bin/bash',
+                 container: 'test-container', **options, &block)
+          subject.exec(name: name, namespace: namespace, command: command,
+                       container: container, **options, &block)
+        end
+
+        let(:url) do
+          'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec' \
+            '?command=%2Fbin%2Fbash&container=test-container&stderr=true&stdin=false&stdout=true&tty=false'
         end
 
         describe "authorization" do
@@ -396,8 +436,8 @@ RSpec.describe K8s::ResourceClient do
 
             it 'creates a websocket connection using the client cert and key data' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
-                'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec?command=%2Fbin%2Fbash&container=test-container&stdin=true&stdout=true&tty=true',
-                [],
+                url,
+                ['v4.channel.k8s.io'],
                 headers: {},
                 tls: hash_including(
                   cert_chain_file: have_file_content('dummy-client-cert-data'),
@@ -414,8 +454,8 @@ RSpec.describe K8s::ResourceClient do
 
             it 'creates a websocket connection using the client cert and key files' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
-                'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec?command=%2Fbin%2Fbash&container=test-container&stdin=true&stdout=true&tty=true',
-                [],
+                url,
+                ['v4.channel.k8s.io'],
                 headers: {},
                 tls: hash_including(
                   cert_chain_file: transport_options[:client_cert],
@@ -426,21 +466,14 @@ RSpec.describe K8s::ResourceClient do
           end
 
           context "when authorization token is provided" do
-            let(:transport_options) do
-              { auth_token: 'dummy-auth-token' }
-            end
+            let(:transport_options) { { auth_token: 'dummy-auth-token' } }
 
             it 'creates a websocket connection using the authorization token' do
               expect(Faye::WebSocket::Client).to have_received(:new).with(
-                'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec?command=%2Fbin%2Fbash&container=test-container&stdin=true&stdout=true&tty=true',
-                [],
-                headers: hash_including(
-                  'Authorization' => 'Bearer dummy-auth-token'
-                ),
-                tls: hash_including(
-                  cert_chain_file: nil,
-                  private_key_file: nil
-                )
+                url,
+                ['v4.channel.k8s.io'],
+                headers: hash_including('Authorization' => 'Bearer dummy-auth-token'),
+                tls: hash_including(cert_chain_file: nil, private_key_file: nil)
               )
             end
           end
@@ -449,54 +482,142 @@ RSpec.describe K8s::ResourceClient do
         describe "command arguments" do
           it "passes the command arguments to the websocket connection" do
             exec(command: ['ls', '-la'])
+
             expect(Faye::WebSocket::Client).to have_received(:new).with(
-              'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec?command=ls&command=-la&container=test-container&stdin=true&stdout=true&tty=true',
-              [],
+              'ws://localhost:8080/api/v1/namespaces/test-namespace/pods/test-pod/exec' \
+                '?command=ls&command=-la&container=test-container&stderr=true&stdin=false&stdout=true&tty=false',
+              ['v4.channel.k8s.io'],
               anything
             )
+          end
+
+          it "omits the container when none is named" do
+            exec(container: nil)
+
+            expect(Faye::WebSocket::Client).to have_received(:new)
+              .with(satisfy { |u| !u.include?('container=') }, anything, anything)
+          end
+        end
+
+        # Byte 0 of every frame is the channel. Concatenating frames whole
+        # leaves it embedded at each boundary, which is what made a large reply
+        # parse or not depending on how the server split it.
+        describe "channel demultiplexing" do
+          let(:frames) { [frame(1, ""), frame(1, "out-a\n"), frame(2, "err\n"), frame(1, "out-b\n"), success] }
+
+          it "separates the streams and strips the channel byte" do
+            result = exec
+
+            expect(result.stdout).to eq("out-a\nout-b\n")
+            expect(result.stderr).to eq("err\n")
+            expect(result.stdout).not_to include("\x01")
+          end
+
+          context "when the server splits a reply mid-token" do
+            let(:frames) do
+              [frame(1, '{"state":"SUCC'), frame(1, 'ESS","size":12'), frame(1, '34}'), success]
+            end
+
+            it "rejoins the payloads into one document" do
+              expect(JSON.parse(exec.stdout)).to eq("state" => "SUCCESS", "size" => 1234)
+            end
+          end
+
+          it "yields each frame with its channel when given a block" do
+            seen = []
+            expect(exec { |payload, channel| seen << [channel, payload] }).to be_nil
+            expect(seen).to eq([[1, "out-a\n"], [2, "err\n"], [1, "out-b\n"]])
+          end
+        end
+
+        describe "exit status" do
+          it "is zero on success" do
+            expect(exec.exit_code).to eq(0)
+            expect(exec).to be_success
+          end
+
+          context "when the command exits non-zero" do
+            let(:status) do
+              {
+                "metadata" => {}, "status" => "Failure",
+                "message" => "command terminated with non-zero exit code: exit status 7",
+                "reason" => "NonZeroExitCode",
+                "details" => { "causes" => [{ "reason" => "ExitCode", "message" => "7" }] }
+              }.to_json
+            end
+            let(:frames) { [frame(1, "out\n"), frame(2, "bad\n"), frame(3, status)] }
+
+            it "reports the code from the v4 status channel" do
+              expect(exec.exit_code).to eq(7)
+              expect(exec).not_to be_success
+            end
+
+            it "raises from value!, naming the program but not its arguments" do
+              expect { exec.value!(['curl', '-u', 'admin:hunter2']) }.to raise_error(
+                K8s::ResourceClient::Exec::CommandFailed, /\Acurl \(2 args\) exited 7: bad\z/
+              )
+            end
+
+            it "says arg, not args, for a single argument" do
+              expect { exec.value!(['sleep', '30']) }.to raise_error(/sleep \(1 arg\)/)
+            end
+          end
+
+          context "when the server speaks the v1 subprotocol" do
+            let(:frames) { [frame(3, "command terminated with non-zero exit code: exit status 3")] }
+
+            it "falls back to parsing the prose" do
+              expect(exec.exit_code).to eq(3)
+            end
+          end
+
+          context "when the socket closes without a status frame" do
+            let(:frames) { [frame(1, "out\n")] }
+
+            it "raises rather than call it a success" do
+              expect { exec }.to raise_error(K8s::ResourceClient::Exec::Error, /without a status frame/)
+            end
           end
         end
 
         describe "stdin" do
-          before do
-            allow(EM).to receive(:open_keyboard).and_invoke(->(handler) { EM.attach($stdin, handler) })
+          let(:frames) { [success] }
+
+          before { allow(EM).to receive(:open_keyboard) { |handler| handler } }
+
+          it "attaches the keyboard only when a tty is asked for" do
+            exec(stdin: true, tty: true)
+            expect(EM).to have_received(:open_keyboard)
           end
 
-          after do
-            $stdin = STDIN
+          it "leaves the keyboard alone by default, as a job has no terminal" do
+            exec
+            expect(EM).not_to have_received(:open_keyboard)
           end
+        end
 
-          it "passes the stdin input to the websocket connection with the stdin channel 0" do
-            rd, wd = IO.pipe
-            $stdin = rd
+        describe "the reactor" do
+          let(:frames) { [success] }
 
-            exec do
-              wd.write("ls\n")
+          it "gives every concurrent caller its own output" do
+            allow(Faye::WebSocket::Client).to receive(:new) do |url, *|
+              FakeSocket.new([frame(1, "#{url[/command=([^&]+)/, 1]}\n"), success])
             end
 
-            expect(ws).to have_received(:send).with([0, 108, 115, 10])
+            results = 4.times.map { |i| Thread.new { exec(command: "call-#{i}") } }.map(&:value)
+
+            expect(results.map { |r| r.stdout.strip }.sort).to eq((0..3).map { |i| "call-#{i}" })
           end
-        end
 
-        private
+          # Calling from the reactor thread would wedge it: the tick that drives
+          # the socket cannot run while its own thread blocks here.
+          it "refuses to run inside the reactor thread, where it would deadlock" do
+            allow(EM).to receive(:reactor_running?).and_return(true)
+            allow(EM).to receive(:reactor_thread).and_return(Thread.current)
 
-        def em
-          EM.run do
-            yield
-            EM.stop
-          end
-        end
-
-        def exec(name: 'test-pod', namespace: 'test-namespace', command: '/bin/bash', container: 'test-container')
-          em do
-            subject.exec(
-              name: name,
-              namespace: namespace,
-              command: command,
-              container: container
+            expect { exec }.to raise_error(
+              K8s::ResourceClient::Exec::Error, /cannot be called from inside the EventMachine reactor thread/
             )
-            yield if block_given?
-            EM.stop
           end
         end
       end
