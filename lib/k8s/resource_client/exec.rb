@@ -2,120 +2,203 @@
 
 module K8s
   class ResourceClient
+    # Executes commands in a container over the API server's exec websocket.
+    #
+    # Kubernetes multiplexes the exec streams down one socket: every frame
+    # begins with a channel byte (1 stdout, 2 stderr, 3 status). Frames must be
+    # demultiplexed as they arrive -- once concatenated the boundaries are gone.
+    # Channel 3 carries the exit status, but only the v4 subprotocol makes it
+    # machine-readable, so we negotiate v4 and fall back to parsing v1's prose.
     module Exec
+      require "eventmachine"
+      require "faye/websocket"
+      require "json"
+      require "termios"
+      require "tempfile"
+
+      SUBPROTOCOL = "v4.channel.k8s.io"
+      STDOUT_CHANNEL = 1
+      STDERR_CHANNEL = 2
+      STATUS_CHANNEL = 3
+      DEFAULT_TIMEOUT = 60
+
+      class Error < StandardError; end
+
+      # Raised when the command ran and exited non-zero. Carries the streams so
+      # a caller can log stderr without re-running the command.
+      class CommandFailed < Error
+        attr_reader :result
+
+        def initialize(result, command)
+          @result = result
+          detail = result.stderr.strip
+          detail = result.stdout.strip if detail.empty?
+          super("#{Array(command).join(' ')} exited #{result.exit_code}: #{detail}")
+        end
+      end
+
+      Result = Struct.new(:stdout, :stderr, :exit_code, keyword_init: true) do
+        def success?
+          exit_code.zero?
+        end
+
+        # stdout, or raise CommandFailed. For callers that want an exception
+        # rather than a status to check.
+        def value!(command = nil)
+          raise CommandFailed.new(self, command) unless success?
+
+          stdout
+        end
+
+        def to_s
+          stdout
+        end
+      end
+
+      # EventMachine's reactor is a process-wide singleton. Calling EM.run when
+      # it is already up does not raise -- it runs the block on the calling
+      # thread and returns immediately, which would hand back an empty result.
+      # So own one reactor thread for the process and schedule onto it. We never
+      # call EM.stop: the reactor may belong to someone else.
+      REACTOR_LOCK = Mutex.new
+
+      def self.schedule(&block)
+        unless EM.reactor_running?
+          REACTOR_LOCK.synchronize do
+            unless EM.reactor_running?
+              up = Queue.new
+              Thread.new { EM.run { up << true } }.name = "k8s-ruby-exec-reactor"
+              up.pop
+            end
+          end
+        end
+        EM.next_tick(&block)
+      end
+
+      # @param status [String, nil] the raw channel 3 payload
+      def self.exit_code(status)
+        raise Error, "exec closed without a status frame" if status.nil?
+
+        doc = JSON.parse(status)
+        return 0 if doc["status"] == "Success"
+
+        cause = doc.dig("details", "causes")&.find { |c| c["reason"] == "ExitCode" }
+        cause ? cause["message"].to_i : 1
+      rescue JSON::ParserError
+        # v1 subprotocol: "command terminated with non-zero exit code: exit status 7"
+        status[/exit (?:status|code) (\d+)/, 1]&.to_i || 1
+      end
+
+      # Command output is normally text. Tag it UTF-8 so callers can parse it,
+      # but leave genuinely binary output alone rather than mislabel it.
+      def self.text(buffer)
+        buffer.force_encoding(Encoding::UTF_8)
+        buffer.valid_encoding? ? buffer : buffer.force_encoding(Encoding::BINARY)
+      end
+
       def self.included(base)
         base.include(InstanceMethods)
         base.include(Logging)
       end
 
       module InstanceMethods
-        require "eventmachine"
-        require "faye/websocket"
-        require "termios"
-        require "tempfile"
-
-        # Executes arbitrary commands in a container.
+        # Executes a command in a container and waits for it to finish.
         #
         # @param name [String] name of the pod
+        # @param command [Array<String>, String] command and arguments
+        # @param container [String, nil] container name; the pod's first when nil
         # @param namespace [String]
-        # @param container [String] name of the container to execute the command in
-        # @param command [Array<String>|String] command to execute. It accepts a single string or an array of strings if multiple arguments are needed.
-        # @param stdin [Boolean] whether to stream stdin to the container
-        # @param stdout [Boolean] whether to stream stdout from the container
-        # @param tty [Boolean] whether to allocate a tty for the container
-        # @yield [String] Optional block to yield the output of the command
-        # @return [String, nil] output of the command. It returns nil if a block is given or tty is true.
+        # @param stdin [Boolean] stream stdin to the container (needs tty)
+        # @param stdout [Boolean] stream stdout from the container
+        # @param stderr [Boolean] stream stderr from the container
+        # @param tty [Boolean] allocate a tty. Needs a controlling terminal, so
+        #   only for interactive use -- never in a job. Output goes to $stdout.
+        # @param timeout [Numeric] seconds to wait before closing the socket
+        # @yield [String, Integer] each frame's payload and channel, as it arrives
+        # @return [Result] stdout, stderr and exit code. nil when tty or a block
+        #   is given, since neither buffers.
+        # @raise [Error] on timeout, socket error, or a close with no status
         #
         # @example
-        #   client.api('v1').resource('pods', namespace: 'default').exec(
-        #     name: 'test-pod',
-        #     container: 'shell',
-        #     command: '/bin/sh'
-        #   )
-        # @example Open a shell:
-        #   exec(name: 'my-pod', container: 'my-container', command: '/bin/sh')
-        # @example Execute single command:
-        #   exec(name: 'my-pod', container: 'my-container', command: 'date')
-        # @example Pass multiple arguments:
-        #   exec(name: 'my-pod', container: 'my-container', command: ['ls', '-la'])
-        # @example Yield the output of the command:
-        #  exec(
-        #    name: "test-pod",
-        #    container: "shell",
-        #    command: [ "watch", "date" ],
-        #  ) do |out|
-        #    puts "local time #{Time.now}"
-        #    puts "server time #{out}"
-        #  end
-        def exec(name:, namespace: @namespace, command:, container:, stdin: true, stdout: true, tty: true)
+        #   pods.exec(name: "web-0", command: %w[cat /etc/hostname]).value!
+        def exec(name:, command:, container: nil, namespace: @namespace,
+                 stdin: false, stdout: true, stderr: true, tty: false,
+                 timeout: Exec::DEFAULT_TIMEOUT, &block)
           query = {
             command: [command].flatten,
-            container: container,
             stdin: !!stdin,
             stdout: !!stdout,
+            stderr: !!stderr,
             tty: !!tty
           }
-
+          query[:container] = container if container
           exec_path = path(name, namespace: namespace, subresource: "exec")
-          output = StringIO.new
 
-          EM.run do
-            ws = @transport.build_ws_conn(exec_path, query)
+          out = +"".b
+          err = +"".b
+          status = nil
+          failure = nil
+          finished = Queue.new
+
+          original_term = (Termios.tcgetattr($stdin) if tty)
+          if original_term
+            raw = original_term.dup
+            raw.lflag &= ~(Termios::ECHO | Termios::ICANON)
+            Termios.tcsetattr($stdin, Termios::TCSANOW, raw)
+          end
+
+          Exec.schedule do
+            ws = @transport.build_ws_conn(exec_path, query, protocols: [Exec::SUBPROTOCOL])
+            timer = EM.add_timer(timeout) do
+              failure ||= Exec::Error.new("exec timed out after #{timeout}s: #{[command].flatten.join(' ')}")
+              ws.close
+            end
 
             ws.on :message do |event|
-              # Previously we were packing event.data (which was an array) into
-              # bytes, but now event.data is turning up already in bytes (a
-              # String with ASCII encoding), i.e. "\x01", perhaps some depdency
-              # is now doing something different...
+              frame = event.data
+              frame = frame.pack("C*") unless frame.is_a?(String)
+              channel = frame.getbyte(0)
+              payload = frame.byteslice(1..) || ""
+              next if payload.empty?
 
-              # So, if the data we receive is already a byte stream...
-              if event.data.is_a?(String) && event.data.encoding == Encoding::ASCII_8BIT
-                #...we can just pass it along _as is_
-                out = event.data
+              case channel
+              when Exec::STATUS_CHANNEL then status = payload
               else
-                #...otherwise treat it as a array of data that needs to be
-                # converted into bytes
-                out = event.data.pack("C*")
-              end
-
-              if block_given?
-                yield(out)
-              elsif tty
-                print out
-              else
-                output.write(out)
-              end
-            end
-
-            ws.on :error do |event|
-              logger.error(event.message)
-            end
-
-            if tty
-              term_attributes_original = Termios.tcgetattr($stdin)
-              term_attributes = term_attributes_original.dup
-              term_attributes.lflag &= ~Termios::ECHO
-              term_attributes.lflag &= ~Termios::ICANON
-              Termios.tcsetattr($stdin, Termios::TCSANOW, term_attributes)
-
-              EM.open_keyboard(Module.new do
-                define_method(:receive_data) do |input|
-                  input = [0] + input.unpack("C*")
-                  ws.send(input)
+                if block then block.call(payload, channel)
+                elsif tty then $stdout.write(payload)
+                elsif channel == Exec::STDERR_CHANNEL then err << payload
+                else out << payload
                 end
+              end
+            end
+
+            if stdin && tty
+              EM.open_keyboard(Module.new do
+                define_method(:receive_data) { |input| ws.send([0] + input.unpack("C*")) }
               end)
             end
 
-            ws.on :close do
-              Termios.tcsetattr($stdin, Termios::TCSANOW, term_attributes_original) if tty
-              EM.stop
+            ws.on(:error) { |event| failure ||= Exec::Error.new(event.message) }
+            ws.on(:close) do
+              EM.cancel_timer(timer)
+              finished << true
             end
           end
 
-          return if tty
+          # The timer closes the socket, which fires :close. The wider deadline
+          # is only so a socket that never closes cannot wedge the caller.
+          wedged = finished.pop(timeout: timeout + 5).nil?
+          Termios.tcsetattr($stdin, Termios::TCSANOW, original_term) if original_term
 
-          output.rewind
-          output.read
+          raise failure if failure
+          raise Exec::Error, "exec never closed: #{[command].flatten.join(' ')}" if wedged
+          return if tty || block
+
+          Result.new(
+            stdout: Exec.text(out),
+            stderr: Exec.text(err),
+            exit_code: Exec.exit_code(status)
+          )
         end
       end
     end

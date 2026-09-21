@@ -419,8 +419,10 @@ module K8s
     # Will use same host and port returned by #server.
     # @param resource_path [String]
     # @param query [Hash]
+    # @param protocols [Array<String>] websocket subprotocols to offer. Exec needs
+    #   v4.channel.k8s.io or later to receive a machine-readable exit status.
     # @return [Faye::WebSocket::Client]
-    def build_ws_conn(resource_path, query = {})
+    def build_ws_conn(resource_path, query = {}, protocols: [])
       private_key_file = nil
       cert_chain_file = nil
 
@@ -445,16 +447,23 @@ module K8s
             resource_path +
             Excon::Utils.query_string(query: query)
 
-      ws = Faye::WebSocket::Client.new(
-        url,
-        [],
+      ws_options = {
         headers: request_options[:headers],
         tls: {
           verify_peer: !!options[:ssl_verify_peer],
           private_key_file: private_key_file,
           cert_chain_file: cert_chain_file
         }
-      )
+      }
+
+      # faye-websocket tunnels through an HTTP CONNECT proxy only. Excon accepts
+      # socks5 too, so pass the proxy on only when the websocket can honour it
+      # rather than silently dialing direct.
+      if options[:proxy] && %w[http https].include?(URI.parse(options[:proxy].to_s).scheme)
+        ws_options[:proxy] = { origin: options[:proxy].to_s }
+      end
+
+      ws = Faye::WebSocket::Client.new(url, protocols, **ws_options)
 
       ws.on(:open) { on_open_callbacks.each(&:call) }
       ws
