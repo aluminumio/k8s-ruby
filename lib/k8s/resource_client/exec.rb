@@ -92,7 +92,9 @@ module K8s
       # Names the command in an error without repeating its arguments, which
       # routinely carry credentials (curl -u, psql, redis-cli -a).
       def self.program(command)
-        argv = [command].flatten
+        argv = [command].flatten.compact
+        return "command" if argv.empty?
+
         argv.length > 1 ? "#{argv.first} (#{argv.length - 1} args)" : argv.first.to_s
       end
 
